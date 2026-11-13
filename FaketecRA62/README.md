@@ -24,6 +24,7 @@
 | `Faketec_RA62_repeater.uf2` / `.zip` | Repeater |
 | `Faketec_RA62_sensor.uf2` / `.zip` | Sensor |
 | `Faketec_RA62_companion_radio_ble.uf2` / `.zip` | Companion (BLE, PIN `123456`) |
+| `Faketec_RA62_companion_radio_ble_cardkb.uf2` / `.zip` | Companion з клавіатурою M5Stack CardKB: набір і надсилання повідомлень з пристрою, див. [CARDKB.md](CARDKB.md) |
 
 Прошивка UF2: двічі натиснути reset → з'явиться USB-диск → скопіювати `.uf2`.
 ZIP — для DFU, веб-flasher або OTA (`start ota`).

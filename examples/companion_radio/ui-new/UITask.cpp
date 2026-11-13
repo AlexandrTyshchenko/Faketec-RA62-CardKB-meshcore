@@ -669,6 +669,18 @@ public:
   #define UI_MSG_PREVIEW_SIZE 78
 #endif
 
+// where a message came from, or where to send one
+struct MsgSource {
+  enum Kind : uint8_t { NONE = 0, CONTACT, CHANNEL };
+  uint8_t kind = NONE;
+  uint8_t key[6] = { 0 };   // contact: public key prefix, channel: key[0] = channel index
+
+  bool matches(const MsgSource& other) const {
+    if (kind != other.kind) return false;
+    return kind == CHANNEL ? key[0] == other.key[0] : memcmp(key, other.key, sizeof(key)) == 0;
+  }
+};
+
 class MsgPreviewScreen : public UIScreen {
   UITask* _task;
   mesh::RTCClock* _rtc;
@@ -677,6 +689,7 @@ class MsgPreviewScreen : public UIScreen {
     uint32_t timestamp;
     char origin[62];
     char msg[UI_MSG_PREVIEW_SIZE];
+    MsgSource src;
   };
   #define MAX_UNREAD_MSGS   32
   int num_unread;
@@ -686,12 +699,13 @@ class MsgPreviewScreen : public UIScreen {
 public:
   MsgPreviewScreen(UITask* task, mesh::RTCClock* rtc) : _task(task), _rtc(rtc) { num_unread = 0; }
 
-  void addPreview(uint8_t path_len, const char* from_name, const char* msg) {
+  void addPreview(uint8_t path_len, const char* from_name, const char* msg, const MsgSource& src) {
     head = (head + 1) % MAX_UNREAD_MSGS;
     if (num_unread < MAX_UNREAD_MSGS) num_unread++;
 
     auto p = &unread[head];
     p->timestamp = _rtc->getCurrentTime();
+    p->src = src;
     if (path_len == 0xFF) {
       sprintf(p->origin, "(D) %s:", from_name);
     } else {
@@ -738,6 +752,13 @@ public:
     return display.isEink() ? 10000 : 1000; // 10 s for eink
   }
 
+  // sender (contact or channel) of the message on screen
+  bool getSource(MsgSource& src) const {
+    if (num_unread == 0) return false;
+    src = unread[head].src;
+    return src.kind != MsgSource::NONE;
+  }
+
   bool handleInput(char c) override {
     if (c == KEY_NEXT || c == KEY_RIGHT) {
       head = (head + MAX_UNREAD_MSGS - 1) % MAX_UNREAD_MSGS;
@@ -755,6 +776,258 @@ public:
     return false;
   }
 };
+
+#ifdef UI_CARDKB
+#include <helpers/ui/CardKB.h>
+
+static CardKB cardkb;
+
+#define KEY_BACKSPACE   8
+#define KEY_TAB         9
+#define KEY_DELETE    127
+
+#ifndef UI_COMPOSE_MAX_DEST
+  #define UI_COMPOSE_MAX_DEST  48   // channels, then the most recently heard contacts
+#endif
+#define UI_COMPOSE_ATTEMPTS  3      // sends of a direct message without an ACK
+
+// Typing a message on the keyboard: "To" line on top, the text below.
+// Up/Down/Tab: destination, Left/Right: cursor, Enter: send, Esc: cancel.
+class ComposeScreen : public UIScreen {
+  struct Dest {
+    MsgSource src;
+    char name[32];
+  };
+
+  UITask* _task;
+  Dest _dests[UI_COMPOSE_MAX_DEST];
+  int _num_dests = 0, _dest = 0;
+  MsgSource _last;   // destination of the last sent message
+
+  char _text[MAX_TEXT_LEN + 1];
+  int _len = 0, _cursor = 0;
+
+  // the last direct message, until it is acknowledged or all attempts are done
+  bool _out_pending = false;
+  MsgSource _out_to;
+  char _out_text[MAX_TEXT_LEN + 1];
+  uint32_t _out_ts = 0;
+  uint32_t _out_acks[UI_COMPOSE_ATTEMPTS];   // the ACK differs for each attempt
+  uint8_t _out_attempt = 0;
+  unsigned long _out_timeout = 0;
+
+  void setDest(Dest& d, uint8_t kind, const uint8_t* key, const char* name) {
+    d.src.kind = kind;
+    memset(d.src.key, 0, sizeof(d.src.key));
+    if (kind == MsgSource::CHANNEL) {
+      d.src.key[0] = key[0];
+    } else {
+      memcpy(d.src.key, key, sizeof(d.src.key));
+    }
+    StrHelper::strncpy(d.name, name, sizeof(d.name));
+  }
+
+  void loadDests() {
+    _num_dests = 0;
+#ifdef MAX_GROUP_CHANNELS
+    ChannelDetails ch;
+    for (int i = 0; i < MAX_GROUP_CHANNELS && _num_dests < UI_COMPOSE_MAX_DEST; i++) {
+      if (!the_mesh.getChannel(i, ch) || ch.name[0] == 0) continue;
+      uint8_t idx = i;
+      setDest(_dests[_num_dests++], MsgSource::CHANNEL, &idx, ch.name);
+    }
+#endif
+    // contacts, most recently heard first
+    const int first = _num_dests, cap = UI_COMPOSE_MAX_DEST - first;
+    uint32_t lastmod[UI_COMPOSE_MAX_DEST];
+    int n = 0;
+    ContactInfo c;
+    ContactsIterator iter = the_mesh.startContactsIterator();
+    while (cap > 0 && iter.hasNext(&the_mesh, c)) {
+      if (c.isEmptySlot() || c.type != ADV_TYPE_CHAT) continue;
+      int pos = n;
+      while (pos > 0 && lastmod[pos - 1] < c.lastmod) pos--;
+      if (pos >= cap) continue;
+      if (n < cap) n++;
+      for (int j = n - 1; j > pos; j--) {
+        _dests[first + j] = _dests[first + j - 1];
+        lastmod[j] = lastmod[j - 1];
+      }
+      setDest(_dests[first + pos], MsgSource::CONTACT, c.id.pub_key, c.name);
+      lastmod[pos] = c.lastmod;
+    }
+    _num_dests = first + n;
+  }
+
+  int findDest(const MsgSource& src) const {
+    for (int i = 0; i < _num_dests; i++) {
+      if (_dests[i].src.matches(src)) return i;
+    }
+    return -1;
+  }
+
+  int maxLen() const {
+    if (_num_dests > 0 && _dests[_dest].src.kind == MsgSource::CHANNEL) {
+      return MAX_TEXT_LEN - (strlen(the_mesh.getNodeName()) + 2);   // sent as "<name>: <text>"
+    }
+    return MAX_TEXT_LEN;
+  }
+
+  bool sendDirect() {
+    ContactInfo* c = the_mesh.lookupContactByPubKey(_out_to.key, sizeof(_out_to.key));
+    uint32_t est_timeout;
+    if (c == NULL || the_mesh.sendMessage(*c, _out_ts, _out_attempt, _out_text,
+                                          _out_acks[_out_attempt], est_timeout) == MSG_SEND_FAILED) {
+      return false;
+    }
+    _out_timeout = millis() + est_timeout;
+    return true;
+  }
+
+  void send() {
+    if (_len > maxLen()) _len = maxLen();
+    _text[_len] = 0;
+    if (_len == 0) return;
+
+    const Dest& d = _dests[_dest];
+    _last = d.src;
+    uint32_t ts = rtc_clock.getCurrentTimeUnique();
+    if (d.src.kind == MsgSource::CHANNEL) {
+#ifdef MAX_GROUP_CHANNELS
+      ChannelDetails ch;
+      bool sent = the_mesh.getChannel(d.src.key[0], ch) &&
+                  the_mesh.sendGroupMessage(ts, ch.channel, the_mesh.getNodeName(), _text, _len);
+#else
+      bool sent = false;
+#endif
+      _task->showAlert(sent ? "Sent" : "Send failed", 1500);
+    } else {
+      _out_to = d.src;
+      strcpy(_out_text, _text);
+      _out_ts = ts;
+      _out_attempt = 0;
+      memset(_out_acks, 0, sizeof(_out_acks));
+      _out_pending = sendDirect();
+      _task->showAlert(_out_pending ? "Sending..." : "Send failed", 1500);
+    }
+    _len = _cursor = 0;
+    _text[0] = 0;
+    _task->gotoHomeScreen();
+  }
+
+public:
+  ComposeScreen(UITask* task) : _task(task) { _text[0] = 0; }
+
+  // to: destination to select (a reply), or NULL for the last used one
+  bool start(const MsgSource* to) {
+    loadDests();
+    if (to != NULL && findDest(*to) < 0 && to->kind == MsgSource::CONTACT) {
+      // reply to a contact that is not in the list: put it in the last place
+      ContactInfo* c = the_mesh.lookupContactByPubKey(to->key, sizeof(to->key));
+      if (c != NULL) {
+        if (_num_dests == UI_COMPOSE_MAX_DEST) _num_dests--;
+        setDest(_dests[_num_dests++], MsgSource::CONTACT, c->id.pub_key, c->name);
+      }
+    }
+    if (_num_dests == 0) return false;
+
+    int i = findDest(to != NULL ? *to : _last);
+    _dest = i < 0 ? 0 : i;
+    _len = _cursor = 0;
+    _text[0] = 0;
+    return true;
+  }
+
+  int render(DisplayDriver& display) override {
+    char tmp[48], filtered[48];
+    display.setTextSize(1);
+    const int cw = display.getTextWidth("W");
+    int cols = display.width() / cw;
+    if (cols > (int)sizeof(tmp) - 1) cols = sizeof(tmp) - 1;
+
+    // header: destination and length
+    display.setColor(UIColor::corp_blue);
+    snprintf(tmp, sizeof(tmp), "%d/%d", _len, maxLen());
+    display.drawTextRightAlign(display.width() - 1, 0, tmp);
+    const int name_w = display.width() - display.getTextWidth(tmp) - cw;
+    const Dest& d = _dests[_dest];
+    snprintf(tmp, sizeof(tmp), "%s%s", d.src.kind == MsgSource::CHANNEL ? "#" : "@", d.name);
+    display.translateUTF8ToBlocks(filtered, tmp, sizeof(filtered));
+    display.drawTextEllipsized(0, 0, name_w, filtered);
+    display.drawRect(0, 10, display.width(), 1);
+
+    // text, wrapped by characters, scrolled to keep the cursor visible
+    const int top = 13, line_h = 8;
+    const int rows = (display.height() - top) / line_h;
+    const int cursor_row = _cursor / cols;
+    const int first_row = cursor_row >= rows ? cursor_row - rows + 1 : 0;
+    display.setColor(UIColor::primary_txt);
+    for (int r = 0; r < rows; r++) {
+      int start = (first_row + r) * cols;
+      if (start >= _len) break;
+      int n = _len - start < cols ? _len - start : cols;
+      memcpy(tmp, &_text[start], n);
+      tmp[n] = 0;
+      display.setCursor(0, top + r * line_h);
+      display.print(tmp);
+    }
+    if ((millis() / 500) % 2 == 0) {   // blinking cursor
+      display.fillRect((_cursor % cols) * cw, top + (cursor_row - first_row) * line_h + 7, cw - 1, 1);
+    }
+    return 250;
+  }
+
+  bool handleInput(char ch) override {
+    const uint8_t c = ch;
+    if (c == KEY_CANCEL) {
+      _task->gotoHomeScreen();
+    } else if (c == KEY_ENTER) {
+      send();
+    } else if (c == KEY_UP) {
+      _dest = (_dest + _num_dests - 1) % _num_dests;
+    } else if (c == KEY_DOWN || c == KEY_TAB) {
+      _dest = (_dest + 1) % _num_dests;
+    } else if (c == KEY_LEFT) {
+      if (_cursor > 0) _cursor--;
+    } else if (c == KEY_RIGHT) {
+      if (_cursor < _len) _cursor++;
+    } else if (c == KEY_BACKSPACE || c == KEY_DELETE) {
+      if (_cursor > 0) {
+        memmove(&_text[_cursor - 1], &_text[_cursor], _len - _cursor + 1);
+        _cursor--;
+        _len--;
+      }
+    } else if (c >= 32 && c < 127 && _len < maxLen()) {
+      memmove(&_text[_cursor + 1], &_text[_cursor], _len - _cursor + 1);
+      _text[_cursor++] = c;
+      _len++;
+    }
+    return true;   // other keys (and the board button) do nothing here
+  }
+
+  // resends a direct message without an ACK; called from UITask::loop()
+  void tick() {
+    if (!_out_pending || (long)(millis() - _out_timeout) < 0) return;
+    while (++_out_attempt < UI_COMPOSE_ATTEMPTS) {
+      if (sendDirect()) return;
+    }
+    _out_pending = false;
+    _task->showAlert("Not delivered", 2000);
+  }
+
+  bool onAck(uint32_t ack) {
+    if (!_out_pending) return false;
+    for (int i = 0; i <= _out_attempt && i < UI_COMPOSE_ATTEMPTS; i++) {
+      if (_out_acks[i] == ack) {
+        _out_pending = false;
+        _task->showAlert("Delivered", 1500);
+        return true;
+      }
+    }
+    return false;
+  }
+};
+#endif
 
 void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* node_prefs) {
   _display = display;
@@ -794,6 +1067,9 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   splash = new SplashScreen(this);
   home = new HomeScreen(this, &rtc_clock, sensors, node_prefs);
   msg_preview = new MsgPreviewScreen(this, &rtc_clock);
+#ifdef UI_CARDKB
+  compose = new ComposeScreen(this);
+#endif
   setCurrScreen(splash);
 }
 
@@ -836,8 +1112,11 @@ void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t t
   if (!(txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN)) return;
 
   uint8_t path_len = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
-  ((MsgPreviewScreen *) msg_preview)->addPreview(path_len, from.name, text);
-  setCurrScreen(msg_preview);
+  MsgSource src;
+  src.kind = MsgSource::CONTACT;
+  memcpy(src.key, from.id.pub_key, sizeof(src.key));
+  ((MsgPreviewScreen *) msg_preview)->addPreview(path_len, from.name, text, src);
+  showPreview();
 
   if (_display != NULL) {
     if (!_display->isOn() && !hasConnection()) {
@@ -859,8 +1138,14 @@ void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t t
 
 void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_details, const char* text) {
   uint8_t path_len = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
-  ((MsgPreviewScreen *) msg_preview)->addPreview(path_len, channel_details.name, text);
-  setCurrScreen(msg_preview);
+  MsgSource src;
+  int idx = the_mesh.findChannelIdx(channel_details.channel);
+  if (idx >= 0) {
+    src.kind = MsgSource::CHANNEL;
+    src.key[0] = idx;
+  }
+  ((MsgPreviewScreen *) msg_preview)->addPreview(path_len, channel_details.name, text, src);
+  showPreview();
 
   if (_display != NULL) {
     if (!_display->isOn() && !hasConnection()) {
@@ -877,12 +1162,55 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
   }
 }
 
+void UITask::showPreview() {
+#ifdef UI_CARDKB
+  if (curr == compose) {
+    showAlert("New message", 1000);
+    return;
+  }
+#endif
+  setCurrScreen(msg_preview);
+}
+
 void UITask::onQueueSizeChanged(int msgcount) {
   _msgcount = msgcount;
   if (msgcount == 0) {
+#ifdef UI_CARDKB
+    if (curr == compose) return;
+#endif
     gotoHomeScreen();
   }
 }
+
+#ifdef UI_CARDKB
+void UITask::onACKRecv(uint32_t ack_crc) {
+  if (((ComposeScreen *) compose)->onAck(ack_crc)) {
+    notify(UIEventType::ack);
+  }
+}
+
+char UITask::handleKeyboard(uint8_t k) {
+  char c = checkDisplayOn((char) k);
+  if (c == 0 || curr == splash) return 0;   // the first key only wakes the display
+  if (curr != compose) {
+    if (k == KEY_CANCEL) {
+      gotoHomeScreen();
+      return 0;
+    }
+    if ((k >= 32 && k < 127) || k == KEY_TAB) {   // start a message (a reply on a message preview)
+      MsgSource src;
+      bool reply = curr == msg_preview && ((MsgPreviewScreen *) msg_preview)->getSource(src);
+      if (!((ComposeScreen *) compose)->start(reply ? &src : NULL)) {
+        showAlert("No contacts", 1500);
+        return 0;
+      }
+      setCurrScreen(compose);
+      return k == KEY_TAB ? 0 : c;   // the typed character goes into the text
+    }
+  }
+  return c;
+}
+#endif
 
 void UITask::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) {
   if (!hasConnection()) {
@@ -1019,6 +1347,13 @@ void UITask::loop() {
       c = checkDisplayOn(KEY_PREV);
     }
   }
+#endif
+#ifdef UI_CARDKB
+  if (c == 0 && _display != NULL) {
+    uint8_t k = cardkb.poll();
+    if (k != 0) c = handleKeyboard(k);
+  }
+  ((ComposeScreen *) compose)->tick();
 #endif
 #if defined(PIN_USER_BTN_ANA)
   if (abs(millis() - _analogue_pin_read_millis) > 10) {

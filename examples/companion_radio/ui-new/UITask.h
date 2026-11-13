@@ -77,6 +77,10 @@ class UITask : public AbstractUITask {
   UIScreen* home;
   UIScreen* msg_preview;
   UIScreen* curr;
+#ifdef UI_CARDKB
+  UIScreen* compose;
+  char handleKeyboard(uint8_t k);
+#endif
 
   void userLedHandler();
 
@@ -87,6 +91,7 @@ class UITask : public AbstractUITask {
   char handleTripleClick(char c);
 
   void setCurrScreen(UIScreen* c);
+  void showPreview();
 
 public:
 
@@ -122,6 +127,9 @@ public:
   void onQueueSizeChanged(int offline_queue_size) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override;
   void onControlDataRecv(const mesh::Packet* pkt) override;
+#ifdef UI_CARDKB
+  void onACKRecv(uint32_t ack_crc) override;
+#endif
 
   // from AbstractUITask
   void notify(UIEventType t = UIEventType::none) override;

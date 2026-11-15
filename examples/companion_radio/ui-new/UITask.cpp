@@ -779,12 +779,17 @@ public:
 
 #ifdef UI_CARDKB
 #include <helpers/ui/CardKB.h>
+#ifdef UI_CYRILLIC
+  #include <helpers/ui/Cyrillic.h>
+#endif
 
 static CardKB cardkb;
 
 #define KEY_BACKSPACE   8
 #define KEY_TAB         9
 #define KEY_DELETE    127
+#define KEY_FN_COMMA  173   // CardKB Fn+','
+#define KEY_FN_PERIOD 174   // CardKB Fn+'.'
 
 #ifndef UI_COMPOSE_MAX_DEST
   #define UI_COMPOSE_MAX_DEST  48   // channels, then the most recently heard contacts
@@ -792,7 +797,9 @@ static CardKB cardkb;
 #define UI_COMPOSE_ATTEMPTS  3      // sends of a direct message without an ACK
 
 // Typing a message on the keyboard: "To" line on top, the text below.
-// Up/Down/Tab: destination, Left/Right: cursor, Enter: send, Esc: cancel.
+// Up/Down: destination (also Tab without UI_CYRILLIC), Left/Right: cursor, Enter: send, Esc: cancel.
+// UI_CYRILLIC: Tab switches the layout EN / UA, the text is kept in Windows-1251 (one byte per letter)
+// and sent as UTF-8; the limits count UTF-8 bytes.
 class ComposeScreen : public UIScreen {
   struct Dest {
     MsgSource src;
@@ -806,6 +813,18 @@ class ComposeScreen : public UIScreen {
 
   char _text[MAX_TEXT_LEN + 1];
   int _len = 0, _cursor = 0;
+#ifdef UI_CYRILLIC
+  bool _ua = false;   // Ukrainian layout
+#endif
+
+  // length of the text as sent (UTF-8 bytes)
+  int sentLen() const {
+#ifdef UI_CYRILLIC
+    return Cyrillic::utf8Length(_text, _len);
+#else
+    return _len;
+#endif
+  }
 
   // the last direct message, until it is acknowledged or all attempts are done
   bool _out_pending = false;
@@ -885,9 +904,17 @@ class ComposeScreen : public UIScreen {
   }
 
   void send() {
-    if (_len > maxLen()) _len = maxLen();
+    while (sentLen() > maxLen()) _len--;   // the limit is lower for a channel
     _text[_len] = 0;
     if (_len == 0) return;
+#ifdef UI_CYRILLIC
+    char text[MAX_TEXT_LEN + 1];
+    Cyrillic::toUtf8(text, _text, _len);
+    const int text_len = strlen(text);
+#else
+    const char* text = _text;
+    const int text_len = _len;
+#endif
 
     const Dest& d = _dests[_dest];
     _last = d.src;
@@ -896,14 +923,14 @@ class ComposeScreen : public UIScreen {
 #ifdef MAX_GROUP_CHANNELS
       ChannelDetails ch;
       bool sent = the_mesh.getChannel(d.src.key[0], ch) &&
-                  the_mesh.sendGroupMessage(ts, ch.channel, the_mesh.getNodeName(), _text, _len);
+                  the_mesh.sendGroupMessage(ts, ch.channel, the_mesh.getNodeName(), text, text_len);
 #else
       bool sent = false;
 #endif
       _task->showAlert(sent ? "Sent" : "Send failed", 1500);
     } else {
       _out_to = d.src;
-      strcpy(_out_text, _text);
+      strcpy(_out_text, text);
       _out_ts = ts;
       _out_attempt = 0;
       memset(_out_acks, 0, sizeof(_out_acks));
@@ -947,7 +974,11 @@ public:
 
     // header: destination and length
     display.setColor(UIColor::corp_blue);
-    snprintf(tmp, sizeof(tmp), "%d/%d", _len, maxLen());
+#ifdef UI_CYRILLIC
+    snprintf(tmp, sizeof(tmp), "%s %d/%d", _ua ? "UA" : "EN", sentLen(), maxLen());
+#else
+    snprintf(tmp, sizeof(tmp), "%d/%d", sentLen(), maxLen());
+#endif
     display.drawTextRightAlign(display.width() - 1, 0, tmp);
     const int name_w = display.width() - display.getTextWidth(tmp) - cw;
     const Dest& d = _dests[_dest];
@@ -985,7 +1016,13 @@ public:
       send();
     } else if (c == KEY_UP) {
       _dest = (_dest + _num_dests - 1) % _num_dests;
+#ifdef UI_CYRILLIC
+    } else if (c == KEY_TAB) {
+      _ua = !_ua;
+    } else if (c == KEY_DOWN) {
+#else
     } else if (c == KEY_DOWN || c == KEY_TAB) {
+#endif
       _dest = (_dest + 1) % _num_dests;
     } else if (c == KEY_LEFT) {
       if (_cursor > 0) _cursor--;
@@ -997,10 +1034,16 @@ public:
         _cursor--;
         _len--;
       }
-    } else if (c >= 32 && c < 127 && _len < maxLen()) {
-      memmove(&_text[_cursor + 1], &_text[_cursor], _len - _cursor + 1);
-      _text[_cursor++] = c;
-      _len++;
+    } else if ((c >= 32 && c < 127) || c == KEY_FN_COMMA || c == KEY_FN_PERIOD) {
+      uint8_t b = c == KEY_FN_COMMA ? ',' : c == KEY_FN_PERIOD ? '.' : c;   // the UA layout has б, ю on these keys
+#ifdef UI_CYRILLIC
+      if (_ua && b == c) b = Cyrillic::ukrainianKey(c);
+#endif
+      if (sentLen() + (b >= 0x80 ? 2 : 1) <= maxLen() && _len < MAX_TEXT_LEN) {
+        memmove(&_text[_cursor + 1], &_text[_cursor], _len - _cursor + 1);
+        _text[_cursor++] = b;
+        _len++;
+      }
     }
     return true;   // other keys (and the board button) do nothing here
   }

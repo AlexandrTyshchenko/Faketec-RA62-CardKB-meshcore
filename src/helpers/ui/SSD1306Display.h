@@ -24,6 +24,9 @@ class SSD1306Display : public DisplayDriver {
   bool _isOn;
   uint8_t _color;
   RefCountedDigitalPin* _peripher_power;
+#ifdef UI_CYRILLIC
+  uint8_t _text_size = 1;
+#endif
 
   bool i2c_probe(TwoWire& wire, uint8_t addr);
 public:
@@ -52,5 +55,9 @@ public:
   void drawRect(int x, int y, int w, int h) override;
   void drawXbm(int x, int y, const uint8_t* bits, int w, int h) override;
   uint16_t getTextWidth(const char* str) override;
+#ifdef UI_CYRILLIC
+  // UTF-8 -> Windows-1251: Cyrillic letters are drawn by print(), other characters as blocks
+  void translateUTF8ToBlocks(char* dest, const char* src, size_t dest_size) override;
+#endif
   void endFrame() override;
 };

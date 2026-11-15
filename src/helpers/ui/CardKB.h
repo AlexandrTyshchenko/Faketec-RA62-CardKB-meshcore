@@ -29,9 +29,12 @@ public:
     if (!_present) {
       if ((long)(now - _next_probe) < 0) return 0;
       _next_probe = now + CARDKB_PROBE_MILLIS;
-      _wire->beginTransmission(CARDKB_I2C_ADDR);
-      _present = _wire->endTransmission() == 0;
-      if (!_present) return 0;
+      // probe with a 1-byte read, as in polling: a zero-length write (address only) is not
+      // reliable on the nRF52 TWIM and missed the keyboard depending on timing
+      if (_wire->requestFrom((uint8_t)CARDKB_I2C_ADDR, (uint8_t)1) != 1) return 0;
+      _present = true;
+      _next_poll = now + CARDKB_POLL_MILLIS;
+      return (uint8_t)_wire->read();   // a key pressed meanwhile, or 0
     }
     if ((long)(now - _next_poll) < 0) return 0;
     _next_poll = now + CARDKB_POLL_MILLIS;
